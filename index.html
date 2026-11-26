@@ -1436,7 +1436,7 @@
     } from "https://www.gstatic.com/firebasejs/10.12.2/firebase-auth.js";
     import {
       getFirestore, initializeFirestore, collection, doc, getDoc, getDocs, setDoc,
-      addDoc, updateDoc, deleteDoc, onSnapshot, query, orderBy, serverTimestamp
+      addDoc, updateDoc, deleteDoc, query, orderBy, limit, startAfter, serverTimestamp
     } from "https://www.gstatic.com/firebasejs/10.12.2/firebase-firestore.js";
 
     // 👇 PEGÁ AQUÍ LOS DATOS DE TU PROYECTO DE FIREBASE 👇
@@ -1482,7 +1482,7 @@
       app = initializeApp(firebaseConfig);
       auth = getAuth(app);
       try {
-        db = initializeFirestore(app, { experimentalAutoDetectLongPolling: true });
+        db = initializeFirestore(app, { experimentalForceLongPolling: true });
       } catch (_) {
         db = getFirestore(app);
       }
@@ -1899,11 +1899,16 @@
       const item = allItems.find(i => i.id === id);
       if (!item || isDemoMode) return;
       await updateDoc(doc(db, "items", id), { sold: !item.sold });
-      showToast(!item.sold ? "Marcada como vendida 🩷" : "Vuelve a estar disponible ✨");
+      item.sold = !item.sold;
+      renderCatalog();
+      showToast(item.sold ? "Marcada como vendida 🩷" : "Vuelve a estar disponible ✨");
     }
     async function deleteItemById(id) {
       if (isDemoMode || !confirm("¿Segura que querés eliminar esta prenda del catálogo?")) return;
       await deleteDoc(doc(db, "items", id));
+      allItems = allItems.filter(i => i.id !== id);
+      updateClosetDropdown();
+      renderCatalog();
       showToast("Prenda eliminada");
     }
 
@@ -2180,14 +2185,22 @@
       try {
         if (isEditing) {
           await updateDoc(doc(db, "items", editingItemId), payload);
+          const idx = allItems.findIndex(i => i.id === editingItemId);
+          if (idx !== -1) allItems[idx] = { ...allItems[idx], ...payload };
+          updateClosetDropdown();
+          renderCatalog();
           closeModal("publishModal");
           showToast("✅ ¡Cambios guardados!");
         } else {
-          await addDoc(collection(db, "items"), {
+          const createdAtMs = Date.now();
+          const docRef = await addDoc(collection(db, "items"), {
             ...payload, sold: false,
             ownerEmail: currentUser.email.toLowerCase(),
-            createdAt: serverTimestamp(), createdAtMs: Date.now()
+            createdAt: serverTimestamp(), createdAtMs
           });
+          allItems.unshift({ id: docRef.id, ...payload, sold: false, ownerEmail: currentUser.email.toLowerCase(), createdAtMs });
+          updateClosetDropdown();
+          renderCatalog();
           closeModal("publishModal");
           showToast("🎉 ¡Prenda publicada en LasChi!");
         }
@@ -2243,49 +2256,78 @@
         </div>`;
     }
 
-    function startItemsListener() {
-      let deepLinkHandled = false;
-      const slowTimer = setTimeout(() => {
-        if (!catalogLoaded) {
-          const el = document.getElementById("catalogLoading");
-          if (el) {
-            el.innerHTML = `
-              <div class="spinner"></div>
-              <h3 style="color:var(--ink); margin-bottom:6px;">La conexión está un poco lenta...</h3>
-              <p style="font-size:0.9rem; font-weight:600; margin-bottom:14px;">Seguimos cargando las prendas. Si estás desde Instagram o WhatsApp, probá abrir el link en Chrome o Safari.</p>
-              <button type="button" class="btn btn-outline btn-sm" onclick="window.location.reload()">🔄 Recargar página</button>`;
-          }
-        }
-      }, 12000);
+    async function startItemsListener() {
+      const params = new URLSearchParams(window.location.search);
+      const targetId = params.get("prenda");
+      const targetCloset = params.get("closet");
+      const PAGE_SIZE = 16;
 
-      onSnapshot(
-        query(collection(db, "items"), orderBy("createdAtMs", "desc")),
-        snap => {
-          clearTimeout(slowTimer);
-          catalogLoaded = true;
-          allItems = snap.docs.map(d => ({ id: d.id, ...d.data() }));
-          updateClosetDropdown();
-          renderCatalog();
-          if (!deepLinkHandled) {
-            const params = new URLSearchParams(window.location.search);
-            const targetId = params.get("prenda");
-            const targetCloset = params.get("closet");
-            if (targetCloset) {
-              closetFilter.value = targetCloset;
-              renderCatalog();
-              deepLinkHandled = true;
+      try {
+        // Si entraron por un link directo a una prenda, la traemos primero al instante
+        if (targetId) {
+          try {
+            const singleSnap = await getDoc(doc(db, "items", targetId));
+            if (singleSnap.exists()) {
+              catalogLoaded = true;
+              allItems = [{ id: singleSnap.id, ...singleSnap.data() }];
+              updateClosetDropdown();
+              setSinglePrendaView(singleSnap.id);
             }
-            if (targetId) {
-              const found = allItems.find(i => i.id === targetId);
-              if (found) { setSinglePrendaView(found.id); deepLinkHandled = true; }
-            }
+          } catch (_) {}
+        }
+
+        // Primera tanda rápida (16 prendas más recientes) por consulta HTTP directa
+        const firstQuery = query(collection(db, "items"), orderBy("createdAtMs", "desc"), limit(PAGE_SIZE));
+        const firstSnap = await getDocs(firstQuery);
+        catalogLoaded = true;
+
+        const firstBatch = firstSnap.docs.map(d => ({ id: d.id, ...d.data() }));
+        if (targetId && allItems.length) {
+          const merged = [...allItems];
+          for (const it of firstBatch) {
+            if (!merged.some(m => m.id === it.id)) merged.push(it);
           }
-        },
-        () => {
-          clearTimeout(slowTimer);
+          allItems = merged;
+        } else {
+          allItems = firstBatch;
+        }
+
+        updateClosetDropdown();
+        if (targetCloset) {
+          closetFilter.value = targetCloset;
+        }
+        renderCatalog();
+
+        // Cargar el resto del catálogo en tandas silenciosas en segundo plano
+        let lastDoc = firstSnap.docs[firstSnap.docs.length - 1];
+        while (lastDoc && firstSnap.docs.length === PAGE_SIZE) {
+          const nextQuery = query(
+            collection(db, "items"),
+            orderBy("createdAtMs", "desc"),
+            startAfter(lastDoc),
+            limit(PAGE_SIZE)
+          );
+          const nextSnap = await getDocs(nextQuery);
+          if (nextSnap.empty) break;
+
+          const moreItems = nextSnap.docs.map(d => ({ id: d.id, ...d.data() }));
+          for (const it of moreItems) {
+            if (!allItems.some(m => m.id === it.id)) allItems.push(it);
+          }
+          updateClosetDropdown();
+          if (targetCloset && !closetFilter.value) {
+            closetFilter.value = targetCloset;
+          }
+          renderCatalog();
+
+          if (nextSnap.docs.length < PAGE_SIZE) break;
+          lastDoc = nextSnap.docs[nextSnap.docs.length - 1];
+        }
+      } catch (err) {
+        if (!catalogLoaded) {
           showCatalogLoadError("Revisá tu señal de internet o abrí la página desde Chrome / Safari y tocá Reintentar.");
         }
-      );
+      }
     }
 
     if (isDemoMode) {
